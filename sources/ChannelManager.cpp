@@ -90,6 +90,8 @@ void ChannelManager::removeFromChannel(Client& client, const std::string& channe
 	if (!channel)
 		return warning("Channel " + channelName + " does not exist");
 
+    
+    // we need to send an ERR 403 here
     std::vector<Client*>& channelClients = channel->getClients();
     std::vector<Client*>::iterator clientIt = std::find(channelClients.begin(), 
                                                 channelClients.end(), &client);
