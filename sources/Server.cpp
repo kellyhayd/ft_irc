@@ -1,4 +1,5 @@
 #include "../include/irc.hpp"
+#include <sys/stat.h>
 
 // ************************************************************************** //
 //                       Constructors & Desctructors                          //
@@ -19,9 +20,9 @@ Server::Server(int port, std::string &password)
 	
 	sockaddr_in	serverAddr;
 	memset(&serverAddr, 0, sizeof(serverAddr));
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    serverAddr.sin_port = htons(_port);
+	serverAddr.sin_family = AF_INET;
+	serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	serverAddr.sin_port = htons(_port);
 
 	int opt = 1;
 	setsockopt(_sockets[0].fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -74,6 +75,8 @@ Client*	Server::getClientByNick(std::string& nickname) const
 }
 
 QuoteBot*	Server::getQuoteBot(void) { return (_quoteBot); }
+
+File*	Server::getFile(void) { return (_file); }
 
 // ************************************************************************** //
 //                             Private Functions                              //
@@ -205,8 +208,8 @@ void	Server::SIGINTHandler(int signum)
 }
 
 void Server::addApiSocket(pollfd &api_pfd) {
-    _sockets.push_back(api_pfd);
-    info("API socket fd " + intToString(api_pfd.fd) + " added for polling.");
+	_sockets.push_back(api_pfd);
+	info("API socket fd " + intToString(api_pfd.fd) + " added for polling.");
 }
 
 void	Server::removeApiSocket(int fd) {
@@ -237,11 +240,201 @@ bool	Server::handleApiEvent(pollfd apiFd)
 	return true;
 }
 
-void	Server::setFile(std::string fileName, std::string filePath, std::string sender, std::string receiver)
+void	Server::setFile(File *file)
 {
 	if (_file != NULL)
 		delete _file;
-	_file = new File(fileName, filePath, sender, receiver);
+	_file = file;
+}
+
+std::string	Server::generateTempFilePath(const std::string& sender, const std::string& fileName) {
+	std::string safeFilename = fileName;
+	std::replace(safeFilename.begin(), safeFilename.end(), '/', '_');
+    std::replace(safeFilename.begin(), safeFilename.end(), '\\', '_');
+
+	std::time_t now = std::time(0);
+	std::ostringstream oss;
+	mkdir("/ircTranfers", 0700);
+	oss << "/ircTranfers/" << sender << "_" << now << "_" << safeFilename;
+	return oss.str();
+}
+
+File* Server::prepareUpload(Client* sender, const std::string& recipient, const std::string& fileName)
+{
+	if (!sender) return NULL;
+
+	std::string transferId = sender->nickname() + "_" + fileName;
+	if (_activeTransfers.count(transferId)) {
+		warning("Transfer with ID: " + transferId + " already exists.");
+		 sendMSG(sender->getFd(), "ERROR :Transfer for " + fileName + " already in progress.");
+		return NULL;
+	}
+
+	File* newTransfer = new File();
+	newTransfer->transferId = transferId;
+	newTransfer->senderNick = sender->nickname();
+	newTransfer->recipientNick = recipient;
+	newTransfer->fileName = fileName;
+	newTransfer->state = PENDING_UPLOAD;
+	newTransfer->senderClient = sender;
+	newTransfer->recipientClient = NULL;
+	newTransfer->lastActivityTime = std::time(0);
+	newTransfer->tempFilePath = generateTempFilePath(sender->nickname(), fileName);
+
+	newTransfer->tempFileStream.open(newTransfer->tempFilePath.c_str(), std::ios::out | std::ios::binary | std::ios::trunc);
+	if (!newTransfer->tempFileStream.is_open()) {
+		error("Failed to open temporary file for writing: " + newTransfer->tempFilePath);
+		delete newTransfer;
+		return NULL;
+	}
+
+	info("Prepared upload for transfer ID: " + transferId + ", temp file: " + newTransfer->tempFilePath);
+	_activeTransfers[transferId] = newTransfer;
+	return newTransfer;
+}
+
+File* Server::getTransferById(const std::string& transferId) {
+	transfersMap::iterator it = _activeTransfers.find(transferId);
+	if (it != _activeTransfers.end()) {
+		return it->second;
+	}
+	return NULL;
+}
+
+void Server::finalizeTransfer(const std::string& transferId, bool deleteTempFile) {
+	transfersMap::iterator it = _activeTransfers.find(transferId);
+	if (it != _activeTransfers.end()) {
+		File* transferInfo = it->second;
+
+		info("Finalizing transfer ID: " + transferId);
+
+		if (transferInfo->tempFileStream.is_open()) {
+			transferInfo->tempFileStream.close();
+		}
+
+		if (deleteTempFile) {
+			if (std::remove(transferInfo->tempFilePath.c_str()) != 0) {
+				warning("Could not remove temporary file: " + transferInfo->tempFilePath);
+			} else {
+				 info("Removed temporary file: " + transferInfo->tempFilePath);
+			}
+		}
+		if(transferInfo->senderClient)
+		{
+			transferInfo->senderClient->setIsUploading(false);
+			transferInfo->senderClient->setCurrentUploadId("");
+		}
+		if(transferInfo->recipientClient)
+		{
+			transferInfo->recipientClient->setIsDownloading(false);
+			transferInfo->recipientClient->setCurrentDownloadId("");
+		}
+		_activeTransfers.erase(it);
+		delete transferInfo;
+	} else
+		warning("Attempted to finalize non-existent transfer ID: " + transferId);
+}
+
+void Server::checkTransferTimeouts() {
+	time_t currentTime = std::time(0);
+	const long timeoutSeconds = 180;
+	std::vector<std::string> timedOutIds;
+
+	for (transfersMap::iterator it = _activeTransfers.begin(); it != _activeTransfers.end(); ++it) {
+		if (it->second->state != UPLOADING && it->second->state != DOWNLOADING)
+		{
+			 if (currentTime - it->second->lastActivityTime > timeoutSeconds)
+			 {
+				 warning("Transfer timed out: " + it->first);
+				 timedOutIds.push_back(it->first);
+				 if(it->second->senderClient)
+				 	sendMSG(it->second->senderClient->getFd(), "ERROR :Transfer for " + it->second->fileName + " timed out.");
+				 if(it->second->recipientClient)
+				 	sendMSG(it->second->recipientClient->getFd(), "ERROR :Transfer for " + it->second->fileName + " from " + it->second->senderNick + " timed out.");
+			 }
+		}
+	}
+	for(size_t i = 0; i < timedOutIds.size(); ++i) {
+		finalizeTransfer(timedOutIds[i], true);
+	}
+}
+
+void	Server::startSendingFile(const std::string& transferId)
+{
+	File* transferInfo = getTransferById(transferId);
+	if (!transferInfo)
+		return warning("startSendingFile: Transfer ID not found: " + transferId);
+	if (transferInfo->state != PENDING_DOWNLOAD && transferInfo->state != UPLOADING)
+		return warning("startSendingFile: Transfer " + transferId + " is not in state PENDING_DOWNLOAD. State: " + intToString(transferInfo->state));
+
+	Client* recipient = transferInfo->recipientClient;
+	if (!recipient)
+	{
+		warning("startSendingFile: Recipient " + (recipient ? recipient->nickname() : "null") + " not found or disconnected for transfer " + transferId);
+		transferInfo->state = FAILED;
+		finalizeTransfer(transferId, true);
+		return;
+	}
+	std::ifstream tempFileReadStream(transferInfo->tempFilePath.c_str(), std::ios::in | std::ios::binary);
+	if (!tempFileReadStream.is_open()) {
+		error("startSendingFile: Failed to open temporary file for reading: " + transferInfo->tempFilePath);
+		transferInfo->state = FAILED;
+		recipient->setIsDownloading(false);
+		recipient->setCurrentDownloadId("");
+		 sendMSG(recipient->getFd(), NOTICE(recipient->nickname(), "ERROR :Server could not read the uploaded file. Transfer failed."));
+		finalizeTransfer(transferId, true);
+		return;
+	}
+
+	info("Starting to send file " + transferInfo->fileName + " (ID: " + transferId + ") to " + recipient->nickname());
+	transferInfo->state = DOWNLOADING;
+	transferInfo->lastActivityTime = std::time(0);
+
+	const size_t chunkSize = 4096;
+	char buffer[chunkSize];
+	bool sendError = false;
+
+	while (tempFileReadStream.read(buffer, chunkSize) || tempFileReadStream.gcount() > 0) {
+		ssize_t bytesToSend = tempFileReadStream.gcount();
+		ssize_t totalSent = 0;
+
+		while (totalSent < bytesToSend) {
+			ssize_t sent = send(recipient->getFd(), buffer + totalSent, bytesToSend - totalSent, MSG_NOSIGNAL);
+
+			if (sent <= 0) {
+				if (sent == 0) {
+					warning("startSendingFile: Client " + recipient->nickname() + " closed connection during transfer " + transferId);
+				} else {
+					perror("send error");
+					warning("startSendingFile: Send error to client " + recipient->nickname() + " during transfer " + transferId + ", errno: " + intToString(errno));
+				}
+				sendError = true;
+				break;
+			}
+			totalSent += sent;
+		}
+		if (sendError) {
+			break;
+		}
+		 transferInfo->lastActivityTime = std::time(0);
+	}
+	tempFileReadStream.close();
+
+	if (sendError) {
+		error("Failed to send file " + transferInfo->fileName + " to " + recipient->nickname());
+		transferInfo->state = FAILED;
+		recipient->setIsDownloading(false);
+		recipient->setCurrentDownloadId("");
+		 sendMSG(recipient->getFd(), NOTICE(recipient->nickname(), "ERROR :Connection error during file download. Transfer failed."));
+		finalizeTransfer(transferId, true);
+	} else {
+		info("Successfully sent file " + transferInfo->fileName + " (ID: " + transferId + ") to " + recipient->nickname());
+		transferInfo->state = TRANSFER_COMPLETE;
+		recipient->setIsDownloading(false);
+		recipient->setCurrentDownloadId("");
+		 sendMSG(recipient->getFd(), NOTICE(recipient->nickname(), "SUCCESS :File download '" + transferInfo->fileName + "' complete."));
+		finalizeTransfer(transferId, true);
+	}
 }
 
 void	Server::setBot()

@@ -75,7 +75,7 @@ void MsgHandler::handlePRIVMSG(std::string &msg, Client &client)
 		return warning("Insufficient parameters for PRIVMSG command");
 	}
 	std::string channelName = command.at(1);
-    std::string message = trailing.at(1);
+	std::string message = trailing.at(1);
 
 	if (msg.find("!quote") != std::string::npos)
 	{
@@ -282,19 +282,19 @@ void	MsgHandler::handleSENDFILE(std::string &msg, Client& client)
 	std::cout << PURPLE << "handleSENDFILE" << RESET << std::endl; // DEBUG
 
 	std::istringstream ss(msg);
-	std::string sendFileCommand, recipientUser, filePath;
+	std::string sendFileCommand, recipientNick, filePath;
 	getline(ss, sendFileCommand, ' ');
-	getline(ss, recipientUser, ' ');
+	getline(ss, recipientNick, ' ');
 	getline(ss, filePath);
-	if (filePath.empty() || recipientUser.empty())
+	if (filePath.empty() || recipientNick.empty())
 	{
 		sendMSG(client.getFd(), ERR_NEEDMOREPARAMS(client, "SENDFILE"));
 		return warning("Insufficient parameters for SENDFILE command");
 	}
-	else if (_server.getClientByNick(recipientUser) == NULL || client.nickname() == recipientUser)
+	else if (_server.getClientByNick(recipientNick) == NULL || client.nickname() == recipientNick)
 	{
-		sendMSG(client.getFd(), ERR_NOSUCHNICK(client, recipientUser));
-		return warning("Recipient " + recipientUser + " does not exist");
+		sendMSG(client.getFd(), ERR_NOSUCHNICK(client, recipientNick));
+		return warning("Recipient " + recipientNick + " does not exist");
 	}
 	size_t pos = filePath.find_last_of('/');
 	if (pos == std::string::npos)
@@ -303,36 +303,160 @@ void	MsgHandler::handleSENDFILE(std::string &msg, Client& client)
 		return warning("File " + filePath + " does not exist");
 	}
 	std::string	fileName = filePath.substr(filePath.find_last_of('/') + 1);
-
-	std::cout << YELLOW << "File name: " << fileName << RESET << std::endl; // DEBUG
-	std::cout << YELLOW << "File path: " << filePath << RESET << std::endl; // DEBUG
-	std::cout << YELLOW << "Recipient: " << recipientUser << RESET << std::endl; // DEBUG
-	std::cout << YELLOW << "Sender: " << client.nickname() << RESET << std::endl; // DEBUG
-
 	std::fstream	file(filePath.c_str());
 	if (file.fail())
 	{
 		sendMSG(client.getFd(), ERR_BADFILEPATH(client, fileName));
 		return warning("File " + filePath + " does not exist");
 	}
-	Client& recipient = *(_server).getClientByNick(recipientUser);
-	_server.setFile(fileName, filePath, client.nickname(), recipientUser);
+	File* fileInfo = _server.prepareUpload(&client, recipientNick, fileName);
 
-	sendMSG(recipient.getFd(), NOTICE(recipientUser, client.nickname() + " wants to send you a file"));
+	if (fileInfo)
+	{
+		client.setIsUploading(true);
+		client.setCurrentUploadId(fileInfo->transferId);
+		sendMSG(client.getFd(), "SENDFILE ACCEPTED ID=" + fileInfo->transferId + " Ready to receive data for " + fileName + "\r\n");
+		info("Sent ready message to " + client.nickname() + " for transfer " + fileInfo->transferId);
+	}
+	else
+	{
+		sendMSG(client.getFd(), "ERROR :Server could not prepare the file transfer. Please try again later.");
+		warning("SENDFILE: Failed to prepare upload for " + client.nickname());
+	}
 }
 
-void	MsgHandler::handleGETFILE(std::string &msg, Client& client)
+void	MsgHandler::handleUploadData(Client &client, const char* dataBuffer, size_t dataSize)
 {
-	std::istringstream ss(msg);
-	std::string getFileCommand, senderUser, fileName;
-	getline(ss, getFileCommand, ' ');
-	getline(ss, senderUser, ' ');
-	getline(ss, fileName);
-	if (senderUser.empty() || fileName.empty())
-	{
-		sendMSG(client.getFd(), ERR_NEEDMOREPARAMS(client, "GETFILE"));
-		return warning("Insufficient parameters for GETFILE command");
+	if (dataSize <= 0)
+		return;
+
+	std::string transferId = client.getCurrentUploadId();
+	if (transferId.empty()) {
+		warning("Client " + client.nickname() + " is in uploading state but has no currentUploadId!");
+		client.setIsUploading(false);
+		sendMSG(client.getFd(), "ERROR :Internal server error during upload. Transfer cancelled.");
+		return;
 	}
+
+	File* transferInfo = _server.getTransferById(transferId);
+	if (!transferInfo) {
+		warning("Client " + client.nickname() + " sent upload data for non-existent transfer ID: " + transferId);
+		client.setIsUploading(false);
+		client.setCurrentUploadId("");
+		sendMSG(client.getFd(), "ERROR :Your file transfer was not found or may have timed out. Transfer cancelled.");
+		return;
+	}
+
+	if (transferInfo->state != PENDING_UPLOAD && transferInfo->state != UPLOADING) {
+		 warning("Client " + client.nickname() + " sent upload data for transfer " + transferId + " which is not in uploading state (" + intToString(transferInfo->state) + ")");
+		 return;
+	}
+
+	if(transferInfo->state == PENDING_UPLOAD)
+		transferInfo->state = UPLOADING;
+
+	transferInfo->lastActivityTime = std::time(0);
+
+	if (transferInfo->tempFileStream.is_open()) {
+		transferInfo->tempFileStream.write(dataBuffer, dataSize);
+		if (transferInfo->tempFileStream.fail()) {
+			error("Failed to write to temporary file: " + transferInfo->tempFilePath + " for transfer " + transferId);
+			transferInfo->state = FAILED;
+			client.setIsUploading(false);
+			client.setCurrentUploadId("");
+			sendMSG(client.getFd(), "ERROR :Server failed to write file data. Transfer cancelled.");
+			_server.finalizeTransfer(transferId, true);
+			return;
+		}
+	} else {
+		error("Temporary file stream is not open for transfer " + transferId);
+		transferInfo->state = FAILED;
+		client.setIsUploading(false);
+		client.setCurrentUploadId("");
+		sendMSG(client.getFd(), "ERROR :Internal server error (file stream). Transfer cancelled.");
+		_server.finalizeTransfer(transferId, false);
+		return;	
+	}
+
+	if (dataSize < 1024)
+	{
+		info("Upload complete for transfer ID: " + transferId + " (" + transferInfo->fileName);
+		transferInfo->tempFileStream.close();
+		transferInfo->state = UPLOAD_COMPLETE;
+		client.setIsUploading(false);
+		client.setCurrentUploadId("");
+
+		Client* recipient = _server.getClientByNick(transferInfo->recipientNick);
+		if (recipient) {
+			transferInfo->recipientClient = recipient;
+			std::string notifyMsg = " :File '" + transferInfo->fileName + " received from " + client.nickname() +
+									". Use: GETFILE " + client.nickname() + " " + transferInfo->fileName + "\r\n";
+			sendMSG(recipient->getFd(), notifyMsg);
+			info("Notified recipient " + recipient->nickname() + " about completed upload " + transferId);
+		}
+		else
+			warning("Recipient " + transferInfo->recipientNick + " is no longer online for transfer " + transferId + ". File stored temporarily.");
+	}
+}
+
+void MsgHandler::handleGETFILE(std::string &msg, Client& client)
+{
+	std::istringstream iss(msg);
+	std::string command, senderNick, filename;
+
+	if (!(iss >> command >> senderNick >> filename)) {
+		sendMSG(client.getFd(), ERR_NEEDMOREPARAMS(client, "GETFILE"));
+		warning("GETFILE: Insufficient parameters from " + client.nickname());
+		return;
+	}
+	std::string remaining;
+	if (iss >> remaining) {
+		sendMSG(client.getFd(), "ERROR :Too many parameters for GETFILE. Use: GETFILE <sender> <filename>");
+		warning("GETFILE: Too many parameters from " + client.nickname());
+		return;
+	}
+
+	std::string transferId = senderNick + "_" + filename;
+	info("GETFILE request from " + client.nickname() + " for transfer ID: " + transferId);
+
+	File* transferInfo = _server.getTransferById(transferId);
+
+	if (!transferInfo) {
+		sendMSG(client.getFd(), "ERROR :No such file transfer pending from " + senderNick + " for file " + filename);
+		warning("GETFILE: Transfer not found: " + transferId + " requested by " + client.nickname());
+		return;
+	}
+
+	if (transferInfo->recipientNick != client.nickname()) {
+		 sendMSG(client.getFd(), "ERROR :You are not the intended recipient for the file '" + filename + "' from " + senderNick);
+		 warning("GETFILE: Permission denied for " + client.nickname() + " requesting transfer " + transferId + " intended for " + transferInfo->recipientNick);
+		return;
+	}
+
+	if (transferInfo->state != UPLOAD_COMPLETE) {
+		 std::string errMsg = "ERROR :File transfer for '" + filename + "' is not ready for download. State: ";
+		 errMsg += intToString(transferInfo->state);
+		 sendMSG(client.getFd(), errMsg);
+		 warning("GETFILE: Transfer " + transferId + " not ready for download, requested by " + client.nickname() + ". State: " + intToString(transferInfo->state));
+		return;
+	}
+
+	 if (client.isDownloading() || client.isUploading()) {
+		  sendMSG(client.getFd(), "ERROR :You are already busy with another file transfer. Please wait or cancel.");
+		  warning("GETFILE: Client " + client.nickname() + " is busy with another transfer.");
+		  return;
+	 }
+
+	info("GETFILE request validated for " + client.nickname() + ". Initiating download for " + transferId);
+
+	transferInfo->recipientClient = &client;
+	transferInfo->lastActivityTime = std::time(0);
+	transferInfo->state = PENDING_DOWNLOAD;
+	client.setIsDownloading(true);
+	client.setCurrentDownloadId(transferId);
+
+	sendMSG(client.getFd(), "SUCCESS :Starting download for file '" + filename + "' from " + senderNick + "...");
+	_server.startSendingFile(transferId);
 }
 
 void MsgHandler::respond(std::string &msg, Client &client)
@@ -385,27 +509,41 @@ void	MsgHandler::receiveMessage(Client &client)
 	char		buffer[1024];
 	ssize_t bytes_read = read(client.getFd(), buffer, sizeof(buffer) - 1);
 	if (bytes_read <= 0) {
+		if (client.isUploading()) {
+			 File* transfer = _server.getTransferById(client.getCurrentUploadId());
+			 if(transfer) {
+				 warning("Client " + client.nickname() + " disconnected during upload of " + transfer->fileName);
+				 transfer->state = FAILED;
+				 _server.finalizeTransfer(transfer->transferId, true);
+			 }
+		}
 		return _server.disconnectClient(&client);
 	}
 	buffer[bytes_read] = '\0';
-	if (!strcmp(buffer, "\r\n")) {
-		return ;
-	}
+
 	std::cout << buffer; // for testing only
 
-	client.msgBuffer += buffer;
-	size_t i;
-	while ((i = client.msgBuffer.find("\r\n")) != std::string::npos)
+	if (client.isUploading())
+		handleUploadData(client, buffer, bytes_read);
+	else
 	{
-		std::string message = client.msgBuffer.substr(0, i);
-		client.msgBuffer.erase(0, i + 2);
-		if (!client.isRegistered() && split(message, ' ').front() == "NICK")
-		{
-			error("Invalid or no password: client disconnected.");
-			sendMSG(client.getFd(), ERR_PASSWDMISMATCH(client));
-			_server.disconnectClient(&client);
+		if (!strcmp(buffer, "\r\n"))
 			return ;
+		
+		client.msgBuffer += buffer;
+		size_t i;
+		while ((i = client.msgBuffer.find("\r\n")) != std::string::npos)
+		{
+			std::string message = client.msgBuffer.substr(0, i);
+			client.msgBuffer.erase(0, i + 2);
+			if (!client.isRegistered() && split(message, ' ').front() == "NICK")
+			{
+				error("Invalid or no password: client disconnected.");
+				sendMSG(client.getFd(), ERR_PASSWDMISMATCH(client));
+				_server.disconnectClient(&client);
+				return ;
+			}
+			respond(message, client);  // maybe take PASS out of this funciton
 		}
-		respond(message, client);  // maybe take PASS out of this funciton
 	}
 }

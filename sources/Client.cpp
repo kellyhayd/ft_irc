@@ -12,6 +12,8 @@ Client::Client(pollfd clientSocket)
 	_isRegistered = false;
 	_isIRCOp = false;
 	_isBot = false;
+	_isUploading = false;
+	_isDownloading = false;
 	msgBuffer = "";
 }
 
@@ -31,6 +33,20 @@ std::string	Client::username() const { return (_username); }
 std::string	Client::nickname() const { return (_nickname); }
 
 std::string	Client::hostname() const { return (_hostname); }
+
+std::string	Client::getCurrentUploadId() const
+{
+	if (_currentUploadId.empty())
+		return "";
+	return _currentUploadId;
+}
+
+std::string	Client::getCurrentDownloadId() const
+{
+	if (_currentDownloadId.empty())
+		return "";
+	return _currentDownloadId;
+}
 
 void	Client::setFullName(std::string &fullname) { _fullname = fullname; }
 
@@ -52,6 +68,14 @@ void	Client::setRegistered(bool status) { _isRegistered = status; }
 
 void	Client::setBot(bool status) { _isBot = status; }
 
+void	Client::setIsUploading(bool status) { _isUploading = status; }
+
+void	Client::setIsDownloading(bool status) { _isDownloading = status; }
+
+void	Client::setCurrentUploadId(const std::string& id) { _currentUploadId = id; }
+
+void	Client::setCurrentDownloadId(const std::string& id) { _currentDownloadId = id; }
+
 bool	Client::isRegistered() const { return (_isRegistered); }
 
 bool	Client::isIRCOp() const { return _isIRCOp; }
@@ -60,6 +84,9 @@ bool	Client::isIRCOp() const { return _isIRCOp; }
 bool	Client::isBot() const { return _isBot; }
 std::vector<Channel*>&	Client::getClientChannels() { return (_clientChannels); }
 
+bool	Client::isUploading() const { return _isUploading; }
+
+bool	Client::isDownloading() const { return _isDownloading; }
 
 std::vector<std::string>	Client::getChannelInvites() const { return (_clientChannelInvites); }
 

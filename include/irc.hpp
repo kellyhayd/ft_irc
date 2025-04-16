@@ -74,6 +74,7 @@
 #define ERR_CHANOPPROVSNEEDED(client, channelName) std::string(":") + SERVER_NAME + " 482 " + client.nickname() + " " + channelName + " : You're not a channel operator\r\n"
 #define ERR_NOOPERHOST(client) std::string(":") + SERVER_NAME + " 491 " + client.nickname() + " :No O-lines for your host\r\n"
 #define ERR_BADFILEPATH(client, fileName) std::string(":") + SERVER_NAME + client.nickname() + " " + fileName + " :Invalid file path\r\n"
+#define ERR_FILEUNAVAILABLE(client, fileName) std::string(":") + SERVER_NAME + client.nickname() + " " + fileName + " :File unavailable\r\n"
 
 #define RPL_WELCOME(client) std::string(":") + SERVER_NAME + " 001 " + client.nickname() + " :Welcome to the IRC Network, " + client.nickname() + "!" + client.username() + "@" + client.hostname() + "\r\n"
 #define RPL_YOURHOST(client) std::string(":") + SERVER_NAME + " 002 " + client.nickname() + " :Your host is " + SERVER_NAME + ", running version 1.0\r\n"

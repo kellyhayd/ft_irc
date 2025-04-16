@@ -10,6 +10,8 @@ class	File;
 
 typedef std::pair<int, Client *>	client_pair_t;
 typedef std::map<int, Client *>		clients_t;
+typedef std::map<std::string, File *> transfersMap;
+
 
 class Server
 {
@@ -25,6 +27,7 @@ class Server
 		File*					_file;
 
 		std::map<std::string, std::string>	_opers;
+		transfersMap	_activeTransfers;
 
 		pollfd	_makePollfd(int fd, short int events, short int revents);
 
@@ -41,6 +44,7 @@ class Server
 		Client*								getClientByUser(std::string& user) const;
 		Client*								getClientByNick(std::string& nick) const;
 		QuoteBot*							getQuoteBot(void);
+		File*								getFile(void);
 		
 		/* member functions*/
 		void 			run(void);
@@ -55,7 +59,14 @@ class Server
 		void			removeApiSocket(int fd);
 		void			setBot();
 		bool			handleApiEvent(pollfd fd);
-		void			setFile(std::string fileName, std::string filePath, std::string sender, std::string receiver);
+		void			setFile(File* file);
+		void			sendFile(std::fstream &file, Client &client);
+		File*			prepareUpload(Client* sender, const std::string& recipientNick, const std::string& filename);
+		std::string		generateTempFilePath(const std::string& sender, const std::string& fileName);
+		File*			getTransferById(const std::string& transferId);
+		void			finalizeTransfer(const std::string& transferId, bool deleteTempFile);
+		void 			checkTransferTimeouts();
+		void			startSendingFile(const std::string& transferId);
 
 		/* static members */
 		static Server*  instance;

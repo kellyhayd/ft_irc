@@ -34,6 +34,7 @@ class MsgHandler
 		void handleDIE(Client &client);
 		void handleSENDFILE(std::string &msg, Client &client);
 		void handleGETFILE(std::string &msg, Client &client);
+		void handleUploadData(Client &client, const char* dataBuffer, size_t dataSize);
 
 };
 
